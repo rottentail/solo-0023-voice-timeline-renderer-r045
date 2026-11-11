@@ -20,31 +20,66 @@ type Harness struct {
 	baseURL string
 	client  *http.Client
 	tempDir string
+	config  service.Config
+	service *service.Service
 	server  *httptest.Server
 }
 
 func NewHarness() (*Harness, error) {
+	return NewHarnessWithConfig(service.Config{})
+}
+
+func NewHarnessWithConfig(config service.Config) (*Harness, error) {
 	tempDir, err := os.MkdirTemp("", "voice-timeline-check-*")
 	if err != nil {
 		return nil, err
 	}
-	repo, err := storage.NewRepository(tempDir)
-	if err != nil {
+	harness := &Harness{
+		client:  &http.Client{Timeout: 45 * time.Second},
+		tempDir: tempDir,
+		config:  config,
+	}
+	if err := harness.start(); err != nil {
 		_ = os.RemoveAll(tempDir)
 		return nil, err
 	}
-	serviceLayer := service.New(repo, service.DefaultConfig())
+	return harness, nil
+}
+
+// start builds a fresh repository, service, and HTTP server over the harness
+// data directory, exactly as a process launch would.
+func (harness *Harness) start() error {
+	repo, err := storage.NewRepository(harness.tempDir)
+	if err != nil {
+		return err
+	}
+	serviceLayer := service.New(repo, harness.config)
 	httpServer := httpapi.New(serviceLayer, httpapi.Options{
 		MaxSourceRequestBytes: 48 << 20,
 		MaxJSONBytes:          2 << 20,
 	})
 	server := httptest.NewServer(httpServer.Handler())
-	return &Harness{
-		baseURL: server.URL,
-		client:  &http.Client{Timeout: 45 * time.Second},
-		tempDir: tempDir,
-		server:  server,
-	}, nil
+	harness.baseURL = server.URL
+	harness.service = serviceLayer
+	harness.server = server
+	return nil
+}
+
+// restart simulates a process exit and relaunch over the same data directory.
+func (harness *Harness) restart() error {
+	harness.server.Close()
+	return harness.start()
+}
+
+// reclaim runs one retention sweep against the live service, as the
+// background sweeper would at the given moment.
+func (harness *Harness) reclaim(ctx context.Context, now time.Time) (service.ReclaimSummary, error) {
+	return harness.service.ReclaimExpiredRenders(ctx, now)
+}
+
+// renderDir returns the on-disk artifact directory of one render.
+func (harness *Harness) renderDir(renderID string) string {
+	return harness.tempDir + string(os.PathSeparator) + "renders" + string(os.PathSeparator) + renderID
 }
 
 func (harness *Harness) Close() {

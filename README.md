@@ -13,6 +13,8 @@ The implementation covers:
 - Equal-power neighboring-span crossfades.
 - Peak normalization into a requested dBFS target.
 - Durable render states, receipts, and atomically committed output folders.
+- Retention-driven reclamation of completed render output with durable
+  reclamation records.
 
 Automated tests are intentionally deferred. A later task stage will add unit,
 integration, and end-to-end verification around the production interfaces.
@@ -45,6 +47,12 @@ Runtime settings are supplied through arguments:
 
 - `-addr`: HTTP listen address, default `:8093`.
 - `-data`: persistent data root, default `./var/voice-timeline`.
+- `-render-retention`: how long a completed render output stays downloadable
+  before the retention sweep reclaims it, default `168h` (7 days).
+  Non-positive values fall back to the default; pick a very large duration to
+  keep outputs effectively forever.
+- `-render-retention-sweep`: interval between retention sweeps, default `1m`.
+  `0` disables the background sweeper (startup reconciliation is skipped too).
 
 No environment variable is required. Do not put credentials in the repository;
 the service does not consume any remote credential.
@@ -146,6 +154,36 @@ The output route returns `audio/wav`. The receipt records source digests, span
 placement, channel mapping, measured peak and RMS amplitude, normalization
 gain, output digest, and non-fatal warnings.
 
+## Render retention and reclamation
+
+Completed render output is kept for `-render-retention` after completion. The
+expiry is persisted on the job record when the render completes, so restarts
+never reset the clock and downloads never extend it. A background sweep (plus
+one reconciliation pass at startup) reclaims expired artifacts:
+
+- Reclamation deletes only `renders/{render_id}/output.wav`. The job record
+  and `receipt.json` stay behind as the durable history of what was
+  delivered, and the job's `retention` block records `expires_at`,
+  `reclaimed_at`, and `reclaim_reason`.
+- The reclamation fact is persisted before the file is deleted, so the job,
+  receipt, and output endpoints never disagree — not even if the process
+  exits between the two steps. A leftover file is finished by the next sweep.
+- A download admitted before reclamation assembles the complete original
+  bytes under one storage lock and is never truncated. Downloads started
+  after reclamation receive `410` with the stable `render_output_reclaimed`
+  error, and fresh downloads cannot pin an expired artifact in storage.
+- After reclamation, `GET /v1/renders/{id}` still returns the completed job
+  (with the retention record), `GET /v1/renders/{id}/receipt` still returns
+  the receipt annotated with the same retention record, and only the output
+  download is gone.
+- If the output file disappears outside the retention flow (for example an
+  operator deletes the directory to free space), the next sweep reconciles
+  the job to the same reclaimed state with reason `output_missing` instead of
+  letting it claim the output is downloadable.
+- Jobs completed before retention existed are stamped with an expiry derived
+  from their completion time on the first sweep, so pre-existing output piles
+  are reclaimed as their retention period elapses.
+
 ## Data directory
 
 ```text
@@ -156,8 +194,8 @@ var/voice-timeline/
   timelines/<timeline_id>.json
   jobs/<render_id>.json
   renders/<render_id>/
-    output.wav
-    receipt.json
+    output.wav        (deleted when the retention period ends)
+    receipt.json      (kept as the durable delivery history)
   tmp/
 ```
 
@@ -187,11 +225,15 @@ Run each declared production check from the repository root:
 go run ./cmd/timelinecheck -workflow ingest-audio-source
 go run ./cmd/timelinecheck -workflow compose-timeline
 go run ./cmd/timelinecheck -workflow render-mixdown
+go run ./cmd/timelinecheck -workflow render-retention
 ```
 
 Each check creates an isolated temporary data directory, starts the real HTTP
 handler, sends generated WAV inputs, and verifies read-back or rendered output.
-The checks are bounded and do not require network access.
+The retention check additionally drives the sweep at synthetic timestamps,
+races downloads against reclamation, restarts the service over the same data
+directory, and reconciles a manually deleted output file. The checks are
+bounded and do not require network access.
 
 ## Deferred test boundary
 

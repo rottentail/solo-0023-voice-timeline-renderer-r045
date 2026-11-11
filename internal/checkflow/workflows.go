@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"time"
 
 	"voice-timeline-renderer/internal/audiocodec"
 	"voice-timeline-renderer/internal/domain"
@@ -14,6 +15,15 @@ import (
 )
 
 func Run(ctx context.Context, workflow string) error {
+	if workflow == "render-retention" {
+		harness, err := NewHarnessWithConfig(service.Config{RenderRetention: time.Hour})
+		if err != nil {
+			return err
+		}
+		defer harness.Close()
+		return runRetention(ctx, harness)
+	}
+
 	harness, err := NewHarness()
 	if err != nil {
 		return err

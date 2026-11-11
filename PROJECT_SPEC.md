@@ -69,12 +69,18 @@ Any active state may transition to `failed`. `completed` and `failed` are
 terminal. A failed job stores a stable error code and message. A completed job
 stores the output file, output metadata, and immutable render receipt.
 
+A completed job also carries a durable retention record: the output expiry
+stamped at completion, and later the reclamation time and reason once the
+output artifact leaves storage. Reclamation is not a state transition; the
+terminal state and its timestamps are preserved.
+
 ### Render receipt
 
 A receipt records source identifiers, span placement, gain adjustments, peak
 and RMS measurements, final normalization gain, frame count, output digest, and
 non-fatal warnings. It is written only after the output bytes have been
-atomically committed.
+atomically committed. The receipt document is retained after output
+reclamation, so the delivery history outlives the downloadable artifact.
 
 ## Workflows
 
@@ -122,6 +128,28 @@ Entry point: `PUT /v1/renders/{render_id}` with a `timeline_id` body field.
 Success is observable through the job resource, the downloaded WAV, and the
 receipt. Failure is observable through the terminal job error code.
 
+### 4. Reclaim expired render output
+
+Entry point: background retention sweep (startup plus configured interval).
+
+1. The sweep lists every completed job and inspects its output artifact.
+2. An output past its persisted expiry is reclaimed: the job's retention
+   record is updated first, then the output file is deleted. The receipt and
+   job records remain as the delivery history.
+3. A job already marked reclaimed whose file still exists (the process exited
+   between the two steps) has the deletion finalized.
+4. A completed job whose output file vanished outside the retention flow is
+   reconciled to the reclaimed state with reason `output_missing`, so the job
+   stops claiming the output is downloadable.
+5. Legacy completed jobs without a retention record are stamped with an
+   expiry derived from their completion time.
+
+A download admitted before reclamation reads the job and the output bytes
+under one storage lock and always delivers the complete original file.
+Downloads started after reclamation receive the stable
+`render_output_reclaimed` error, and new downloads cannot extend an expired
+artifact's lifetime.
+
 ## HTTP interface
 
 - `GET /healthz`
@@ -133,6 +161,10 @@ receipt. Failure is observable through the terminal job error code.
 - `GET /v1/renders/{id}`
 - `GET /v1/renders/{id}/receipt`
 - `GET /v1/renders/{id}/output`
+
+The receipt route keeps serving the receipt after reclamation, annotated with
+the job's retention record. The output route answers `410` with the stable
+`render_output_reclaimed` code once the artifact has been reclaimed.
 
 Errors use a JSON envelope:
 
@@ -161,7 +193,12 @@ Errors use a JSON envelope:
 
 - State transitions: render jobs persist every active and terminal transition.
 - Error propagation: domain errors retain stable codes through HTTP responses.
-- Resource lifecycle: temporary files are cleaned after failed publication.
+- Resource lifecycle: temporary files are cleaned after failed publication;
+  completed output is reclaimed when its persisted retention period ends.
+- Retention consistency: the reclamation record is persisted before the output
+  file is deleted, downloads assemble the file under one storage read lock,
+  and a startup sweep reconciles crash windows and externally deleted files,
+  so the job, receipt, and output endpoints always agree on availability.
 - Concurrency: storage guards indexes and registry updates; unique IDs and
   atomic renames prevent duplicate or half-visible records.
 - Validation boundaries: request size, PCM layout, timeline bounds, and gain
@@ -176,6 +213,10 @@ The runtime manifest exposes one bounded production smoke path per workflow:
   fails.
 - Render a crossfaded timeline, download the output, decode it, and match core
   receipt measurements.
+- Render with a bounded retention period, sweep at a synthetic expiry instant,
+  and confirm the job, receipt, and output endpoints consistently report the
+  reclamation across concurrent downloads, a service restart, and a manually
+  deleted output file.
 
 These checks use the real HTTP entry points and local storage. They are not a
 replacement for the test suite that the later task stage will add.

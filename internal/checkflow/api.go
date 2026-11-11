@@ -168,6 +168,32 @@ func (harness *Harness) getOutput(
 	return body, status, nil
 }
 
+// getOutputRaw returns the output response without interpreting the status,
+// so checks can assert gone and other non-200 outcomes.
+func (harness *Harness) getOutputRaw(
+	ctx context.Context,
+	id string,
+) ([]byte, int, error) {
+	status, body, err := harness.requestJSON(ctx, "GET", "/v1/renders/"+id+"/output", nil)
+	if err != nil {
+		return nil, status, err
+	}
+	return body, status, nil
+}
+
+// getReceiptRaw returns the receipt response body and status without
+// interpreting them.
+func (harness *Harness) getReceiptRaw(
+	ctx context.Context,
+	id string,
+) ([]byte, int, error) {
+	status, body, err := harness.requestJSON(ctx, "GET", "/v1/renders/"+id+"/receipt", nil)
+	if err != nil {
+		return nil, status, err
+	}
+	return body, status, nil
+}
+
 func failureCode(body []byte) string {
 	var envelope failureEnvelope
 	if err := decodeBody(body, &envelope); err != nil {

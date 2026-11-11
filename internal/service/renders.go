@@ -85,6 +85,10 @@ func (s *Service) CreateRender(
 	}
 	job.Output = &result.Output
 	job.ReceiptDigest = result.Output.Digest
+	// The retention clock starts at completion and is persisted with the
+	// terminal state, so a restart never extends or resets it.
+	expiresAt := time.Now().UTC().Add(s.config.RenderRetention)
+	job.Retention = &domain.RenderRetention{ExpiresAt: &expiresAt}
 	if err := s.advanceJob(&job, domain.RenderCompleted, nil); err != nil {
 		return job, true, err
 	}

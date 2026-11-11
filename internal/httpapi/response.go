@@ -57,6 +57,8 @@ func statusForKind(kind domain.ErrorKind) int {
 		return http.StatusConflict
 	case domain.KindNotFound:
 		return http.StatusNotFound
+	case domain.KindGone:
+		return http.StatusGone
 	case domain.KindTooLarge:
 		return http.StatusRequestEntityTooLarge
 	default:

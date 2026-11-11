@@ -47,6 +47,22 @@ const (
 	RenderFailed     RenderState = "failed"
 )
 
+// Reclaim reasons recorded on a job when its output artifact leaves storage.
+const (
+	ReclaimReasonRetentionExpired = "retention_expired"
+	ReclaimReasonOutputMissing    = "output_missing"
+)
+
+// RenderRetention is the durable lifecycle record of a completed render's
+// output artifact. ExpiresAt is stamped when the job completes; ReclaimedAt
+// and ReclaimReason are stamped when the artifact leaves storage, whether by
+// retention expiry or by reconciling an externally removed file.
+type RenderRetention struct {
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	ReclaimedAt   *time.Time `json:"reclaimed_at,omitempty"`
+	ReclaimReason string     `json:"reclaim_reason,omitempty"`
+}
+
 type OutputAsset struct {
 	Digest        string  `json:"digest"`
 	ByteCount     int64   `json:"byte_count"`
@@ -60,14 +76,33 @@ type OutputAsset struct {
 }
 
 type RenderJob struct {
-	ID            string       `json:"id"`
-	TimelineID    string       `json:"timeline_id"`
-	State         RenderState  `json:"state"`
-	Error         *ErrorDetail `json:"error,omitempty"`
-	Output        *OutputAsset `json:"output,omitempty"`
-	ReceiptDigest string       `json:"receipt_digest,omitempty"`
-	CreatedAt     time.Time    `json:"created_at"`
-	UpdatedAt     time.Time    `json:"updated_at"`
+	ID            string           `json:"id"`
+	TimelineID    string           `json:"timeline_id"`
+	State         RenderState      `json:"state"`
+	Error         *ErrorDetail     `json:"error,omitempty"`
+	Output        *OutputAsset     `json:"output,omitempty"`
+	ReceiptDigest string           `json:"receipt_digest,omitempty"`
+	Retention     *RenderRetention `json:"retention,omitempty"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
+}
+
+// Reclaimed reports whether the render output artifact has left storage. The
+// job record and receipt remain as the durable history of the delivery.
+func (job *RenderJob) Reclaimed() bool {
+	return job.Retention != nil && job.Retention.ReclaimedAt != nil
+}
+
+// MarkReclaimed records that the output artifact left storage at the given
+// time. It is not a state transition: the terminal state and UpdatedAt stay
+// untouched so the job keeps describing the original delivery.
+func (job *RenderJob) MarkReclaimed(at time.Time, reason string) {
+	if job.Retention == nil {
+		job.Retention = &RenderRetention{}
+	}
+	stamp := at.UTC()
+	job.Retention.ReclaimedAt = &stamp
+	job.Retention.ReclaimReason = reason
 }
 
 type ReceiptSpan struct {

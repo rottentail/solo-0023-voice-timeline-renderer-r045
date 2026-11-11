@@ -14,6 +14,7 @@ const (
 	KindNotFound ErrorKind = "not_found"
 	KindTooLarge ErrorKind = "too_large"
 	KindUnready  ErrorKind = "unready"
+	KindGone     ErrorKind = "gone"
 	KindInternal ErrorKind = "internal"
 )
 

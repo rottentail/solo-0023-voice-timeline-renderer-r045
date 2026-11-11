@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"sync"
+	"time"
 
 	"voice-timeline-renderer/internal/domain"
 )
@@ -15,14 +16,22 @@ type Repository interface {
 	GetTimeline(string) (domain.Timeline, error)
 	SaveJob(domain.RenderJob) error
 	GetJob(string) (domain.RenderJob, error)
+	ListJobs() ([]domain.RenderJob, error)
 	CommitRenderArtifacts(string, []byte, domain.RenderReceipt) error
-	GetRenderOutput(string) ([]byte, domain.RenderReceipt, error)
+	GetRenderReceipt(string) (domain.RenderReceipt, error)
+	GetRenderDownload(string) (domain.RenderJob, []byte, domain.RenderReceipt, error)
+	RenderOutputExists(string) (bool, error)
+	DeleteRenderOutput(string) error
 }
 
 type Config struct {
 	MaxSourceBytes  int64
 	MaxSpans        int
 	MaxOutputFrames int64
+	// RenderRetention is how long a completed render's output artifact is
+	// kept before the retention sweep reclaims it. Non-positive values fall
+	// back to the default.
+	RenderRetention time.Duration
 }
 
 func DefaultConfig() Config {
@@ -30,6 +39,7 @@ func DefaultConfig() Config {
 		MaxSourceBytes:  32 << 20,
 		MaxSpans:        64,
 		MaxOutputFrames: 48000 * 180,
+		RenderRetention: 7 * 24 * time.Hour,
 	}
 }
 
@@ -49,6 +59,9 @@ func New(repo Repository, config Config) *Service {
 	}
 	if config.MaxOutputFrames <= 0 {
 		config.MaxOutputFrames = defaults.MaxOutputFrames
+	}
+	if config.RenderRetention <= 0 {
+		config.RenderRetention = defaults.RenderRetention
 	}
 	return &Service{repo: repo, config: config}
 }
@@ -96,25 +109,69 @@ func (s *Service) GetRender(ctx context.Context, id string) (domain.RenderJob, e
 	return s.repo.GetJob(id)
 }
 
-func (s *Service) GetReceipt(ctx context.Context, id string) (domain.RenderReceipt, error) {
-	job, err := s.GetRender(ctx, id)
+// ReceiptView is the receipt document annotated with the job's retention
+// record, so the receipt endpoint explains whether the described artifact can
+// still be downloaded. The stored receipt file itself stays immutable.
+type ReceiptView struct {
+	domain.RenderReceipt
+	Retention *domain.RenderRetention `json:"retention,omitempty"`
+}
+
+func (s *Service) GetReceipt(ctx context.Context, id string) (ReceiptView, error) {
+	if err := ctx.Err(); err != nil {
+		return ReceiptView{}, err
+	}
+	job, err := s.repo.GetJob(id)
 	if err != nil {
-		return domain.RenderReceipt{}, err
+		return ReceiptView{}, err
 	}
 	if job.State != domain.RenderCompleted {
-		return domain.RenderReceipt{}, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render receipt is available only after completion")
+		return ReceiptView{}, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render receipt is available only after completion")
 	}
-	_, receipt, err := s.repo.GetRenderOutput(id)
-	return receipt, err
+	receipt, err := s.repo.GetRenderReceipt(id)
+	if err != nil {
+		if appErr := domain.AsAppError(err); appErr.Kind == domain.KindUnready {
+			// A completed job whose receipt document itself vanished can only
+			// be reported honestly as no longer stored.
+			return ReceiptView{}, reclaimedError()
+		}
+		return ReceiptView{}, err
+	}
+	return ReceiptView{RenderReceipt: receipt, Retention: job.Retention}, nil
 }
 
 func (s *Service) GetOutput(ctx context.Context, id string) ([]byte, domain.RenderReceipt, error) {
-	job, err := s.GetRender(ctx, id)
+	if err := ctx.Err(); err != nil {
+		return nil, domain.RenderReceipt{}, err
+	}
+	// The job record and the output bytes are read under one storage lock, so
+	// a download admitted here assembles the complete original file even when
+	// a retention sweep is waiting to reclaim it.
+	job, payload, receipt, err := s.repo.GetRenderDownload(id)
 	if err != nil {
+		if appErr := domain.AsAppError(err); appErr.Kind == domain.KindNotFound {
+			return nil, domain.RenderReceipt{}, err
+		}
+		if job.State == domain.RenderCompleted {
+			// The artifact file is gone; the job record is the source of
+			// truth for why (reclaimed, or externally removed and about to be
+			// reconciled by the sweep).
+			return nil, domain.RenderReceipt{}, reclaimedError()
+		}
 		return nil, domain.RenderReceipt{}, err
 	}
 	if job.State != domain.RenderCompleted {
 		return nil, domain.RenderReceipt{}, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render output is available only after completion")
 	}
-	return s.repo.GetRenderOutput(id)
+	if job.Reclaimed() {
+		// Marked reclaimed but the file is still on disk: the sweep has
+		// recorded the reclamation and is about to delete the bytes. The job
+		// record wins, so the endpoints never disagree.
+		return nil, domain.RenderReceipt{}, reclaimedError()
+	}
+	return payload, receipt, nil
+}
+
+func reclaimedError() *domain.AppError {
+	return domain.E(domain.KindGone, "render_output_reclaimed", "render_id", "render output was reclaimed and is no longer downloadable; the job record and receipt remain available")
 }
